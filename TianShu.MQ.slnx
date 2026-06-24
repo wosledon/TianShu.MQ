@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TianShu.MQ.AspNetCore/TianShu.MQ.AspNetCore.csproj" />
+    <Project Path="src/TianShu.MQ.Persist/TianShu.MQ.Persist.csproj" />
+    <Project Path="src/TianShu.MQ/TianShu.MQ.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TianShu.MQ.Benchmarks/TianShu.MQ.Benchmarks.csproj" />
+    <Project Path="tests/TianShu.MQ.Tests/TianShu.MQ.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <PackageId>TianShu.MQ</PackageId>
+        <Version>1.0.0</Version>
+        <Description>本地高性能嵌入式消息队列，支持内存和持久化两种模式</Description>
+        <Authors>TianShu</Authors>
+        <RootNamespace>TianShu.MQ</RootNamespace>
+    </PropertyGroup>
+    <ItemGroup>
+        <InternalsVisibleTo Include="TianShu.MQ.Persist" />
+        <InternalsVisibleTo Include="TianShu.MQ.AspNetCore" />
+        <InternalsVisibleTo Include="TianShu.MQ.Tests" />
+    </ItemGroup>
+</Project>

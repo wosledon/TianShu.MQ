@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <PackageId>TianShu.MQ.AspNetCore</PackageId>
+        <Version>1.0.0</Version>
+        <Description>TianShu MQ ASP.NET Core 集成包</Description>
+        <Authors>TianShu</Authors>
+        <RootNamespace>TianShu.MQ.AspNetCore</RootNamespace>
+    </PropertyGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\TianShu.MQ\TianShu.MQ.csproj" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.*" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.*" />
+    </ItemGroup>
+</Project>
