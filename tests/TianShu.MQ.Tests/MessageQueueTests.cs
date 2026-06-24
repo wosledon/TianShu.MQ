@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using TianShu.MQ.Core;
@@ -222,5 +223,85 @@ public class MessageQueueTests
 
         topics = mq.ListTopics();
         Assert.DoesNotContain("to-delete", topics);
+    }
+
+    [Fact]
+    public async Task GenericPublish_ShouldWork()
+    {
+        await using var mq = new MessageQueue();
+        await mq.CreateTopicAsync(new TopicOptions { Name = "generic-test", Partitions = 1 });
+
+        var producer = new DefaultMessageProducer(mq);
+        var consumer = new DefaultMessageConsumer(mq);
+
+        await producer.PublishAsync("generic-test", "key1", new { Name = "hello", Value = 42 });
+
+        var pulled = await consumer.PullAsync("generic-test", "g1", 10);
+        Assert.Single(pulled);
+    }
+
+    [Fact]
+    public async Task ManualAck_ShouldCommitOffset()
+    {
+        await using var mq = new MessageQueue();
+        await mq.CreateTopicAsync(new TopicOptions { Name = "ack-test", Partitions = 1 });
+
+        var producer = new DefaultMessageProducer(mq);
+        var consumer = new DefaultMessageConsumer(mq);
+
+        for (int i = 0; i < 3; i++)
+        {
+            await producer.PublishAsync("ack-test", new Message
+            {
+                Body = Encoding.UTF8.GetBytes($"msg-{i}"),
+                PartitionKey = "k"
+            });
+        }
+
+        // Pull 两次，验证 offset 提交
+        var batch1 = await consumer.PullAsync("ack-test", "ack-grp", 2);
+        Assert.Equal(2, batch1.Length);
+
+        var batch2 = await consumer.PullAsync("ack-test", "ack-grp", 10);
+        Assert.Single(batch2);
+    }
+
+    [Fact]
+    public async Task ConsumerGroup_Lag_ShouldBeCorrect()
+    {
+        await using var mq = new MessageQueue();
+        await mq.CreateTopicAsync(new TopicOptions { Name = "lag-test", Partitions = 2 });
+
+        var producer = new DefaultMessageProducer(mq);
+        for (int i = 0; i < 6; i++)
+        {
+            await producer.PublishAsync("lag-test", new Message
+            {
+                Body = Encoding.UTF8.GetBytes($"msg-{i}"),
+                PartitionKey = $"key{i % 2}"
+            });
+        }
+
+        var progress = await mq.GetConsumerGroupProgressAsync("lag-test", "cg1");
+        Assert.Equal(2, progress.Partitions.Length);
+
+        var totalLag = progress.Partitions.Sum(p => p.Lag);
+        Assert.Equal(6, totalLag);
+    }
+
+    [Fact]
+    public async Task MemoryCapacity_ShouldBeRespected()
+    {
+        await using var mq = new MessageQueue();
+        await mq.CreateTopicAsync(new TopicOptions
+        {
+            Name = "cap-test",
+            Partitions = 1,
+            Storage = StorageMode.Memory,
+            MemoryCapacity = 100
+        });
+
+        var stats = await mq.GetTopicStatsAsync("cap-test");
+        Assert.Equal(0, stats.TotalMessages);
     }
 }

@@ -5,17 +5,38 @@ using System.Threading.Tasks;
 namespace TianShu.MQ.Core;
 
 /// <summary>
+/// ACK 确认接口（手动提交 offset）
+/// </summary>
+public interface IAck
+{
+    /// <summary>确认消息已处理，提交 offset</summary>
+    Task CommitAsync();
+
+    /// <summary>拒绝消息（不提交 offset，下次会重试）</summary>
+    Task RejectAsync();
+}
+
+/// <summary>
 /// 消息消费者接口
 /// </summary>
 public interface IMessageConsumer : IAsyncDisposable
 {
     /// <summary>
-    /// 订阅主题（Push 模式，回调消费）
+    /// 订阅主题（Push 模式，回调消费，自动 ACK）
     /// </summary>
     Task SubscribeAsync(
         string topic,
         string groupId,
         Func<Message, Task<ConsumeResult>> handler,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 订阅主题（Push 模式，回调消费，手动 ACK）
+    /// </summary>
+    Task SubscribeAsync(
+        string topic,
+        string groupId,
+        Func<Message, IAck, Task> handler,
         CancellationToken cancellationToken = default);
 
     /// <summary>

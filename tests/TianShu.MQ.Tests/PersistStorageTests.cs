@@ -75,7 +75,7 @@ public class PersistStorageTests : IDisposable
     public async Task PersistEngine_Recovery_ShouldRestoreData()
     {
         // 写入数据
-        var engine1 = new PersistStorageEngine(_testPath, TimeSpan.FromMilliseconds(50));
+        var engine1 = new PersistStorageEngine(_testPath, FlushStrategy.Periodic, TimeSpan.FromMilliseconds(50));
         await engine1.InitializeAsync("recovery-topic", 1);
 
         for (int i = 0; i < 3; i++)

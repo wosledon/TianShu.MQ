@@ -2,7 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
@@ -13,32 +13,125 @@ using TianShu.MQ.Storage;
 namespace TianShu.MQ.Persist;
 
 /// <summary>
-/// 基于本地文件的持久化存储引擎
-/// 采用追加写日志 + 内存索引的结构
+/// 基于追加写日志的持久化存储引擎
+/// 每个分区独立文件：{topicPath}/{partition}/data.log
+/// 每条记录格式：[8字节offset][8字节bodyLength][utf8-body][8字节timestamp][4字节headLength][headers-json]
+/// 恢复时按日志文件重放构建内存索引
 /// </summary>
 public sealed class PersistStorageEngine : IStorageEngine
 {
     private readonly string _basePath;
-    private readonly ConcurrentDictionary<string, TopicData> _topics = new();
     private readonly TimeSpan _flushInterval;
+    private readonly FlushStrategy _flushStrategy;
+    private readonly ConcurrentDictionary<string, TopicData> _topics = new();
 
-    public PersistStorageEngine(string basePath, TimeSpan? flushInterval = null)
+    public PersistStorageEngine(string basePath, FlushStrategy flushStrategy = FlushStrategy.Periodic, TimeSpan? flushInterval = null)
     {
         _basePath = basePath;
+        _flushStrategy = flushStrategy;
         _flushInterval = flushInterval ?? TimeSpan.FromMilliseconds(100);
         Directory.CreateDirectory(_basePath);
     }
 
+    /// <summary>
+    /// 偏移量持久化管理器
+    /// </summary>
+    public sealed class OffsetStore
+    {
+        private readonly string _filePath;
+        private readonly object _lock = new();
+        private Dictionary<string, Dictionary<int, long>> _offsets = new();
+        private bool _dirty;
+
+        public OffsetStore(string basePath)
+        {
+            _filePath = Path.Combine(basePath, "_offsets.json");
+            Load();
+        }
+
+        public long GetCommittedOffset(string topic, string groupId, int partition)
+        {
+            lock (_lock)
+            {
+                if (_offsets.TryGetValue($"{topic}:{groupId}", out var parts))
+                    return parts.GetValueOrDefault(partition, 0);
+                return 0;
+            }
+        }
+
+        public void CommitOffset(string topic, string groupId, int partition, long offset)
+        {
+            lock (_lock)
+            {
+                var key = $"{topic}:{groupId}";
+                if (!_offsets.TryGetValue(key, out var parts))
+                {
+                    parts = new Dictionary<int, long>();
+                    _offsets[key] = parts;
+                }
+
+                if (!parts.TryGetValue(partition, out var existing) || offset > existing)
+                {
+                    parts[partition] = offset;
+                    _dirty = true;
+                }
+            }
+        }
+
+        public void Flush()
+        {
+            if (!_dirty) return;
+            lock (_lock)
+            {
+                try
+                {
+                    var json = JsonSerializer.Serialize(_offsets);
+                    File.WriteAllText(_filePath, json);
+                    _dirty = false;
+                }
+                catch
+                {
+                    // Log error
+                }
+            }
+        }
+
+        private void Load()
+        {
+            if (!File.Exists(_filePath)) return;
+            try
+            {
+                var json = File.ReadAllText(_filePath);
+                var data = JsonSerializer.Deserialize<Dictionary<string, Dictionary<int, long>>>(json);
+                if (data != null) _offsets = data;
+            }
+            catch
+            {
+                // Corrupted, start fresh
+            }
+        }
+    }
+
+    // ===== Partition 日志格式 =====
+    // [offset:8B][bodyLen:4B][body:bodyLen][ts:8B][headerLen:2B][headersJson:headerLen]
+    private static readonly byte[] NewLine = { (byte)'\n' };
+
     private sealed class PartitionData
     {
+#pragma warning disable CS0649
         public long EarliestOffset = 0;
+#pragma warning restore CS0649
         public long NextOffset;
         public readonly List<Message> Messages = new();
         public readonly Channel<long> WaitChannel;
         public readonly object WriteLock = new();
+        public readonly string LogFilePath;
+        public FileStream? LogStream;
+        public long BytesWritten;
 
-        public PartitionData()
+        public PartitionData(string logFilePath)
         {
+            LogFilePath = logFilePath;
             WaitChannel = Channel.CreateBounded<long>(new BoundedChannelOptions(1024)
             {
                 SingleReader = false,
@@ -46,103 +139,169 @@ public sealed class PersistStorageEngine : IStorageEngine
                 FullMode = BoundedChannelFullMode.DropOldest
             });
         }
+
+        public void OpenLog()
+        {
+            var dir = Path.GetDirectoryName(LogFilePath)!;
+            Directory.CreateDirectory(dir);
+            LogStream = new FileStream(LogFilePath, FileMode.Append, FileAccess.Write, FileShare.Read, 8192, true);
+        }
+
+        public void AppendToLog(Message msg)
+        {
+            if (LogStream == null) return;
+
+            var bodyBytes = msg.Body ?? Array.Empty<byte>();
+            var headerJson = JsonSerializer.Serialize(msg.Headers);
+            var headerBytes = Encoding.UTF8.GetBytes(headerJson);
+
+            // 写入日志行：消息体长度 + 消息体 JSON + 换行
+            // 简化格式：每条消息一行 JSON
+            var logEntry = JsonSerializer.Serialize(new
+            {
+                msg.MessageId,
+                Body = Convert.ToBase64String(bodyBytes),
+                msg.PartitionKey,
+                msg.Offset,
+                Headers = msg.Headers,
+                Timestamp = msg.Timestamp,
+                msg.ScheduledEnqueueTime,
+                msg.Topic,
+                msg.Partition
+            });
+
+            var lineBytes = Encoding.UTF8.GetBytes(logEntry + "\n");
+            LogStream.Write(lineBytes, 0, lineBytes.Length);
+            BytesWritten += lineBytes.Length;
+        }
+
+        public void FlushLog()
+        {
+            LogStream?.Flush(true);
+        }
+
+        public void CloseLog()
+        {
+            LogStream?.Flush(true);
+            LogStream?.Close();
+            LogStream?.Dispose();
+            LogStream = null;
+        }
     }
 
     private sealed class TopicData : IAsyncDisposable
     {
         public readonly PartitionData[] Partitions;
-        public readonly string DataPath;
-        private readonly Timer _flushTimer;
-        private volatile bool _dirty;
-        private readonly object _flushLock = new();
+        public readonly Timer? FlushTimer;
+        private readonly Action? _flushAction;
 
-        public TopicData(int partitionCount, string dataPath, TimeSpan flushInterval)
+        public TopicData(int partitionCount, string topicPath, TimeSpan flushInterval, FlushStrategy strategy)
         {
             Partitions = new PartitionData[partitionCount];
             for (int i = 0; i < partitionCount; i++)
             {
-                Partitions[i] = new PartitionData();
+                var logPath = Path.Combine(topicPath, i.ToString(), "data.log");
+                Partitions[i] = new PartitionData(logPath);
             }
-            DataPath = dataPath;
-            _flushTimer = new Timer(_ => FlushIfNeeded(), null, flushInterval, flushInterval);
-        }
 
-        public void MarkDirty() => _dirty = true;
-
-        private void FlushIfNeeded()
-        {
-            if (!_dirty) return;
-            _dirty = false;
-            FlushToFile();
-        }
-
-        public void FlushToFile()
-        {
-            lock (_flushLock)
+            if (strategy == FlushStrategy.Periodic)
             {
-                try
+                _flushAction = () =>
                 {
-                    var allMessages = new List<Message>();
-                    foreach (var part in Partitions)
+                    foreach (var p in Partitions)
                     {
-                        lock (part.WriteLock)
-                        {
-                            allMessages.AddRange(part.Messages);
-                        }
+                        lock (p.WriteLock) p.FlushLog();
                     }
-                    var json = JsonSerializer.Serialize(allMessages);
-                    File.WriteAllText(DataPath, json);
-                }
-                catch
-                {
-                    // Log error but don't crash
-                }
+                };
+                FlushTimer = new Timer(_ => _flushAction(), null, flushInterval, flushInterval);
             }
+        }
+
+        public void OpenAllLogs()
+        {
+            foreach (var p in Partitions)
+                p.OpenLog();
         }
 
         public ValueTask DisposeAsync()
         {
-            _flushTimer.Dispose();
-            FlushToFile(); // 最终刷盘
+            FlushTimer?.Dispose();
+            foreach (var p in Partitions)
+            {
+                lock (p.WriteLock) p.CloseLog();
+            }
             return ValueTask.CompletedTask;
         }
     }
 
-    public Task InitializeAsync(string topic, int partitions, CancellationToken cancellationToken = default)
+    public Task InitializeAsync(string topic, int partitions, int? capacity = null, CancellationToken cancellationToken = default)
     {
         var topicPath = Path.Combine(_basePath, topic);
         Directory.CreateDirectory(topicPath);
 
-        var dataFile = Path.Combine(topicPath, "data.json");
-        var topicData = new TopicData(partitions, dataFile, _flushInterval);
+        var topicData = new TopicData(partitions, topicPath, _flushInterval, _flushStrategy);
 
-        // 加载已有数据
-        if (File.Exists(dataFile))
+        // 恢复已有数据：从每个分区的日志文件中回放
+        for (int p = 0; p < partitions; p++)
         {
-            try
+            var logFile = Path.Combine(topicPath, p.ToString(), "data.log");
+            if (File.Exists(logFile))
             {
-                var json = File.ReadAllText(dataFile);
-                var messages = JsonSerializer.Deserialize<List<Message>>(json) ?? new();
-                foreach (var msg in messages)
+                try
                 {
-                    if (msg.Partition >= 0 && msg.Partition < partitions)
+                    var part = topicData.Partitions[p];
+                    var lines = File.ReadAllLines(logFile);
+                    foreach (var line in lines)
                     {
-                        var part = topicData.Partitions[msg.Partition];
-                        // 恢复时重新分配 offset（因为 Offset 属性不会反序列化）
-                        msg.Offset = part.NextOffset;
-                        part.Messages.Add(msg);
-                        part.NextOffset = msg.Offset + 1;
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        try
+                        {
+                            var doc = JsonDocument.Parse(line);
+                            var root = doc.RootElement;
+
+                            var msg = new Message
+                            {
+                                MessageId = root.GetProperty("MessageId").GetString() ?? Guid.NewGuid().ToString("N"),
+                                Body = Convert.FromBase64String(root.GetProperty("Body").GetString() ?? ""),
+                                PartitionKey = root.GetProperty("PartitionKey").GetString() ?? "",
+                                Offset = part.NextOffset,
+                                Timestamp = root.GetProperty("Timestamp").GetDateTime(),
+                                Topic = topic,
+                                Partition = p
+                            };
+
+                            if (root.TryGetProperty("ScheduledEnqueueTime", out var scheduled) && scheduled.ValueKind != System.Text.Json.JsonValueKind.Null)
+                                msg.ScheduledEnqueueTime = scheduled.GetDateTime();
+
+                            if (root.TryGetProperty("Headers", out var headersProp) && headersProp.ValueKind == System.Text.Json.JsonValueKind.Object)
+                            {
+                                foreach (var h in headersProp.EnumerateObject())
+                                {
+                                    msg.Headers[h.Name] = h.Value.GetString() ?? "";
+                                }
+                            }
+
+                            part.Messages.Add(msg);
+                            part.NextOffset = msg.Offset + 1;
+                        }
+                        catch
+                        {
+                            // Skip corrupted line
+                        }
                     }
                 }
-            }
-            catch
-            {
-                // 数据损坏，重新开始
+                catch
+                {
+                    // Corrupted log file, start fresh
+                }
             }
         }
 
         if (!_topics.TryAdd(topic, topicData))
             throw new InvalidOperationException($"Topic '{topic}' already exists.");
+
+        // 恢复完成后打开日志文件
+        topicData.OpenAllLogs();
 
         return Task.CompletedTask;
     }
@@ -163,9 +322,14 @@ public sealed class PersistStorageEngine : IStorageEngine
             message.Partition = partition;
             part.Messages.Add(message);
             part.NextOffset = offset + 1;
+
+            // 追加写入日志
+            part.AppendToLog(message);
+
+            if (_flushStrategy == FlushStrategy.PerWrite)
+                part.FlushLog();
         }
 
-        topicData.MarkDirty();
         part.WaitChannel.Writer.TryWrite(offset);
         return Task.FromResult(offset);
     }
@@ -189,10 +353,13 @@ public sealed class PersistStorageEngine : IStorageEngine
                 messages[i].Partition = partition;
                 part.Messages.Add(messages[i]);
                 part.NextOffset = offset + 1;
+                part.AppendToLog(messages[i]);
             }
+
+            if (_flushStrategy == FlushStrategy.PerWrite)
+                part.FlushLog();
         }
 
-        topicData.MarkDirty();
         part.WaitChannel.Writer.TryWrite(offsets[^1]);
         return Task.FromResult(offsets);
     }
@@ -224,7 +391,6 @@ public sealed class PersistStorageEngine : IStorageEngine
     {
         if (!_topics.TryGetValue(topic, out var topicData))
             throw new InvalidOperationException($"Topic '{topic}' does not exist.");
-
         return topicData.Partitions[partition].NextOffset;
     }
 
@@ -232,7 +398,6 @@ public sealed class PersistStorageEngine : IStorageEngine
     {
         if (!_topics.TryGetValue(topic, out var topicData))
             throw new InvalidOperationException($"Topic '{topic}' does not exist.");
-
         return topicData.Partitions[partition].EarliestOffset;
     }
 
@@ -257,10 +422,7 @@ public sealed class PersistStorageEngine : IStorageEngine
                 }
             }
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            // Timeout
-        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
     }
 
     public async Task DeleteAsync(string topic, CancellationToken cancellationToken = default)
@@ -277,9 +439,7 @@ public sealed class PersistStorageEngine : IStorageEngine
     public async ValueTask DisposeAsync()
     {
         foreach (var kvp in _topics)
-        {
             await kvp.Value.DisposeAsync();
-        }
         _topics.Clear();
     }
 }

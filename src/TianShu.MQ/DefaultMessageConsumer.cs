@@ -9,18 +9,54 @@ using TianShu.MQ.Core;
 namespace TianShu.MQ;
 
 /// <summary>
+/// ACK 实现
+/// </summary>
+internal sealed class Ack : IAck
+{
+    private readonly ConsumerGroupManager _groupManager;
+    private readonly int _partition;
+    private readonly long _offset;
+    private bool _committed;
+
+    public Ack(ConsumerGroupManager groupManager, int partition, long offset)
+    {
+        _groupManager = groupManager;
+        _partition = partition;
+        _offset = offset;
+    }
+
+    public Task CommitAsync()
+    {
+        if (!_committed)
+        {
+            _groupManager.CommitOffset(_partition, _offset + 1);
+            _committed = true;
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task RejectAsync()
+    {
+        _committed = true; // 标记已处理，但不提交 offset
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
 /// 默认消息消费者实现
 /// </summary>
 public sealed class DefaultMessageConsumer : IMessageConsumer
 {
     private readonly MessageQueue _queue;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _subscriptions = new();
-    private readonly TimeSpan _pollInterval = TimeSpan.FromMilliseconds(100);
     private readonly TimeSpan _waitTimeout = TimeSpan.FromSeconds(5);
+    private readonly int _consumerIndex;
+    private static int _globalConsumerCount;
 
     public DefaultMessageConsumer(MessageQueue queue)
     {
         _queue = queue;
+        _consumerIndex = Interlocked.Increment(ref _globalConsumerCount) - 1;
     }
 
     /// <inheritdoc/>
@@ -30,27 +66,30 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
         Func<Message, Task<ConsumeResult>> handler,
         CancellationToken cancellationToken = default)
     {
-        var key = $"{topic}:{groupId}";
-        if (_subscriptions.ContainsKey(key))
-            throw new InvalidOperationException($"Already subscribed to '{topic}' with group '{groupId}'.");
+        await SubscribeCoreAsync(topic, groupId,
+            async (msg, partition, groupManager, engine, ct) =>
+            {
+                var result = await handler(msg);
+                if (result == ConsumeResult.Success || result == ConsumeResult.Ignore)
+                {
+                    groupManager.CommitOffset(partition, msg.Offset + 1);
+                }
+            }, cancellationToken);
+    }
 
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _subscriptions[key] = cts;
-
-        var options = _queue.GetTopicOptions(topic)
-            ?? throw new InvalidOperationException($"Topic '{topic}' does not exist.");
-
-        var groupManager = _queue.GetConsumerGroupManager(topic, groupId);
-        var engine = _queue.GetStorageEngine(topic);
-
-        // 简化版：单消费者获取所有分区
-        var partitions = Enumerable.Range(0, options.Partitions).ToArray();
-
-        // 为每个分区启动消费任务
-        var tasks = partitions.Select(p => ConsumePartitionAsync(
-            topic, groupId, p, handler, groupManager, engine, cts.Token));
-
-        await Task.WhenAll(tasks);
+    /// <inheritdoc/>
+    public async Task SubscribeAsync(
+        string topic,
+        string groupId,
+        Func<Message, IAck, Task> handler,
+        CancellationToken cancellationToken = default)
+    {
+        await SubscribeCoreAsync(topic, groupId,
+            async (msg, partition, groupManager, engine, ct) =>
+            {
+                var ack = new Ack(groupManager, partition, msg.Offset);
+                await handler(msg, ack);
+            }, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -75,7 +114,7 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
 
             foreach (var msg in messages)
             {
-                // 跳过延迟消息
+                // 跳过延迟消息（未到投递时间）
                 if (msg.ScheduledEnqueueTime.HasValue && msg.ScheduledEnqueueTime.Value > DateTime.UtcNow)
                     continue;
 
@@ -103,11 +142,39 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
         return Task.CompletedTask;
     }
 
-    private async Task ConsumePartitionAsync(
+    private async Task SubscribeCoreAsync(
         string topic,
         string groupId,
+        Func<Message, int, ConsumerGroupManager, Storage.IStorageEngine, CancellationToken, Task> handleMessage,
+        CancellationToken cancellationToken = default)
+    {
+        var key = $"{topic}:{groupId}";
+        if (_subscriptions.ContainsKey(key))
+            throw new InvalidOperationException($"Already subscribed to '{topic}' with group '{groupId}'.");
+
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _subscriptions[key] = cts;
+
+        var options = _queue.GetTopicOptions(topic)
+            ?? throw new InvalidOperationException($"Topic '{topic}' does not exist.");
+
+        var groupManager = _queue.GetConsumerGroupManager(topic, groupId);
+        var engine = _queue.GetStorageEngine(topic);
+
+        // 使用 ConsumerGroupManager 分配分区
+        var partitions = groupManager.AssignPartitions(options.Partitions, _consumerIndex, _globalConsumerCount);
+
+        // 为每个分配的分区启动消费任务
+        var tasks = partitions.Select(p => ConsumePartitionAsync(
+            topic, p, handleMessage, groupManager, engine, cts.Token));
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ConsumePartitionAsync(
+        string topic,
         int partition,
-        Func<Message, Task<ConsumeResult>> handler,
+        Func<Message, int, ConsumerGroupManager, Storage.IStorageEngine, CancellationToken, Task> handleMessage,
         ConsumerGroupManager groupManager,
         Storage.IStorageEngine engine,
         CancellationToken cancellationToken)
@@ -119,7 +186,6 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
 
             if (offset >= latest)
             {
-                // 等待新消息
                 try
                 {
                     await engine.WaitForMessagesAsync(topic, partition, offset, _waitTimeout, cancellationToken);
@@ -137,22 +203,17 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
             {
                 if (cancellationToken.IsCancellationRequested) break;
 
-                // 跳过延迟消息
+                // 跳过延迟消息（未到投递时间）
                 if (msg.ScheduledEnqueueTime.HasValue && msg.ScheduledEnqueueTime.Value > DateTime.UtcNow)
                     continue;
 
                 try
                 {
-                    var result = await handler(msg);
-                    if (result == ConsumeResult.Success || result == ConsumeResult.Ignore)
-                    {
-                        groupManager.CommitOffset(partition, msg.Offset + 1);
-                    }
-                    // Failure: 不提交 offset，下次重试
+                    await handleMessage(msg, partition, groupManager, engine, cancellationToken);
                 }
                 catch
                 {
-                    // 异常时不提交，下次重试
+                    // 异常时不提交 offset，下次重试
                 }
             }
         }
@@ -166,6 +227,5 @@ public sealed class DefaultMessageConsumer : IMessageConsumer
             kvp.Value.Dispose();
         }
         _subscriptions.Clear();
-        await ValueTask.CompletedTask;
     }
 }

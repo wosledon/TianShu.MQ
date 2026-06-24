@@ -16,4 +16,7 @@ public sealed class TopicOptions
 
     /// <summary>内存模式下的最大容量（消息数量）</summary>
     public int MemoryCapacity { get; set; } = 1_000_000;
+
+    /// <summary>刷盘策略（仅持久化模式）</summary>
+    public FlushStrategy FlushStrategy { get; set; } = FlushStrategy.Periodic;
 }

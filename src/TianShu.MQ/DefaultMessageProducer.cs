@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using TianShu.MQ.Core;
+using TianShu.MQ.Serialization;
 
 namespace TianShu.MQ;
 
@@ -14,10 +15,16 @@ namespace TianShu.MQ;
 public sealed class DefaultMessageProducer : IMessageProducer
 {
     private readonly MessageQueue _queue;
+    private readonly IMessageSerializer _serializer;
 
-    public DefaultMessageProducer(MessageQueue queue)
+    public DefaultMessageProducer(MessageQueue queue) : this(queue, new DefaultMessageSerializer())
+    {
+    }
+
+    public DefaultMessageProducer(MessageQueue queue, IMessageSerializer serializer)
     {
         _queue = queue;
+        _serializer = serializer;
     }
 
     /// <inheritdoc/>
@@ -30,6 +37,29 @@ public sealed class DefaultMessageProducer : IMessageProducer
         var engine = _queue.GetStorageEngine(topic);
 
         await engine.AppendAsync(topic, partition, message, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task PublishAsync<T>(string topic, string? partitionKey, T body, CancellationToken cancellationToken = default)
+    {
+        var msg = new Message
+        {
+            Body = _serializer.Serialize(body),
+            PartitionKey = partitionKey ?? string.Empty
+        };
+        await PublishAsync(topic, msg, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task PublishAsync<T>(string topic, string? partitionKey, T body, DateTime scheduledTime, CancellationToken cancellationToken = default)
+    {
+        var msg = new Message
+        {
+            Body = _serializer.Serialize(body),
+            PartitionKey = partitionKey ?? string.Empty,
+            ScheduledEnqueueTime = scheduledTime
+        };
+        await PublishAsync(topic, msg, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -90,7 +120,7 @@ public sealed class DefaultMessageProducer : IMessageProducer
 
         // 使用 MurmurHash3 风格哈希，保证均匀分布
         var hash = GetStableHashCode(partitionKey);
-        return Math.Abs(hash % partitionCount);
+        return (hash & 0x7FFFFFFF) % partitionCount;
     }
 
     /// <summary>
@@ -103,7 +133,7 @@ public sealed class DefaultMessageProducer : IMessageProducer
             int hash1 = 5381;
             int hash2 = hash1;
 
-            for (int i = 0; i < str.Length && str[i] != '\0'; i += 2)
+            for (int i = 0; i < str.Length; i += 2)
             {
                 hash1 = ((hash1 << 5) + hash1) ^ str[i];
                 if (i + 1 < str.Length)

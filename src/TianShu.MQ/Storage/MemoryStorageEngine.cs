@@ -21,7 +21,6 @@ public sealed class MemoryStorageEngine : IStorageEngine
     {
         private readonly Message[] _buffer;
         private readonly int _capacity;
-        private long _writeIndex;      // 下一个写入位置（在 buffer 中的位置）
         private long _nextOffset;      // 下一个 offset
         private long _earliestOffset;  // 最早可用的 offset
         private readonly Channel<long> _waitChannel;
@@ -33,7 +32,6 @@ public sealed class MemoryStorageEngine : IStorageEngine
             _buffer = new Message[_capacity];
             _nextOffset = 0;
             _earliestOffset = 0;
-            _writeIndex = 0;
             _waitChannel = Channel.CreateBounded<long>(new BoundedChannelOptions(1024)
             {
                 SingleReader = false,
@@ -51,7 +49,6 @@ public sealed class MemoryStorageEngine : IStorageEngine
                 var bufferIndex = (int)(offset % _capacity);
                 _buffer[bufferIndex] = message;
                 _nextOffset = offset + 1;
-                _writeIndex = bufferIndex + 1;
 
                 // 如果写满了，推进最早 offset（RingBuffer 覆盖）
                 if (_nextOffset - _earliestOffset > _capacity)
@@ -152,12 +149,13 @@ public sealed class MemoryStorageEngine : IStorageEngine
 
     private readonly ConcurrentDictionary<string, PartitionData[]> _topics = new();
 
-    public Task InitializeAsync(string topic, int partitions, CancellationToken cancellationToken = default)
+    public Task InitializeAsync(string topic, int partitions, int? capacity = null, CancellationToken cancellationToken = default)
     {
+        var cap = capacity ?? 1_000_000;
         var parts = new PartitionData[partitions];
         for (int i = 0; i < partitions; i++)
         {
-            parts[i] = new PartitionData(capacity: 0);
+            parts[i] = new PartitionData(cap);
         }
 
         if (!_topics.TryAdd(topic, parts))

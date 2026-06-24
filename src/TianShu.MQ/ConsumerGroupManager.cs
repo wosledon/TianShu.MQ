@@ -53,13 +53,13 @@ public sealed class ConsumerGroupManager
     }
 
     /// <summary>
-    /// 重置所有分区的 offset
+    /// 重置所有分区的 offset（包括尚未提交的分区）
     /// </summary>
-    public void ResetAllOffsets(long offset)
+    public void ResetAllOffsets(long offset, int totalPartitions)
     {
-        foreach (var key in _committedOffsets.Keys)
+        for (int i = 0; i < totalPartitions; i++)
         {
-            _committedOffsets[key] = offset;
+            _committedOffsets[i] = offset;
         }
     }
 

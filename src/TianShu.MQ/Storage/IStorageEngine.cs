@@ -26,7 +26,7 @@ public interface IStorageEngine : IAsyncDisposable
     long GetEarliestOffset(string topic, int partition);
 
     /// <summary>初始化存储（创建 Topic/Partition）</summary>
-    Task InitializeAsync(string topic, int partitions, CancellationToken cancellationToken = default);
+    Task InitializeAsync(string topic, int partitions, int? capacity = null, CancellationToken cancellationToken = default);
 
     /// <summary>删除 Topic 所有数据</summary>
     Task DeleteAsync(string topic, CancellationToken cancellationToken = default);

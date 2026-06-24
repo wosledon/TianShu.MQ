@@ -18,10 +18,19 @@ public sealed class MessageQueue : IAsyncDisposable
     private readonly ConcurrentDictionary<string, ConsumerGroupManager> _consumerGroups = new();
 
     private readonly IStorageEngine _defaultMemoryEngine;
+    private Func<string, TopicOptions, IStorageEngine>? _storageEngineFactory;
 
     public MessageQueue()
     {
         _defaultMemoryEngine = new MemoryStorageEngine();
+    }
+
+    /// <summary>
+    /// 注册自定义存储引擎工厂（用于支持持久化等扩展）
+    /// </summary>
+    public void RegisterStorageEngineFactory(Func<string, TopicOptions, IStorageEngine> factory)
+    {
+        _storageEngineFactory = factory;
     }
 
     /// <summary>
@@ -32,8 +41,8 @@ public sealed class MessageQueue : IAsyncDisposable
         if (!_topicOptions.TryAdd(options.Name, options))
             throw new InvalidOperationException($"Topic '{options.Name}' already exists.");
 
-        IStorageEngine engine = GetOrCreateStorageEngine(options.Name, options.Storage);
-        await engine.InitializeAsync(options.Name, options.Partitions, cancellationToken);
+        IStorageEngine engine = GetOrCreateStorageEngine(options.Name, options);
+        await engine.InitializeAsync(options.Name, options.Partitions, options.MemoryCapacity, cancellationToken);
     }
 
     /// <summary>
@@ -153,15 +162,17 @@ public sealed class MessageQueue : IAsyncDisposable
         });
     }
 
-    private IStorageEngine GetOrCreateStorageEngine(string topic, StorageMode mode)
+    private IStorageEngine GetOrCreateStorageEngine(string topic, TopicOptions options)
     {
         return _storageEngines.GetOrAdd(topic, _ =>
         {
-            return mode switch
+            return options.Storage switch
             {
                 StorageMode.Memory => _defaultMemoryEngine,
-                StorageMode.Persist => throw new NotSupportedException(
-                    "Persist storage requires TianShu.MQ.Persist package."),
+                StorageMode.Persist => _storageEngineFactory?.Invoke(topic, options)
+                    ?? throw new NotSupportedException(
+                        "Persist storage requires registering a storage factory via RegisterStorageEngineFactory(). " +
+                        "Use TianShu.MQ.Persist.PersistStorageEngine."),
                 _ => _defaultMemoryEngine
             };
         });
